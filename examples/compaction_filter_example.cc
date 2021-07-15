@@ -64,7 +64,7 @@ int main() {
   options.create_if_missing = true;
   options.merge_operator.reset(new MyMerge);
   options.compaction_filter = &filter;
-  status = rocksdb::DB::Open(options, "/tmp/rocksmergetest", &raw_db);
+  status = rocksdb::DB::Open(n, "/tmp/rocksmergetest", &raw_db);
   assert(status.ok());
   std::unique_ptr<rocksdb::DB> db(raw_db);
 
