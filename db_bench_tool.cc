@@ -31,7 +31,6 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
-#include <bitset>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
@@ -49,7 +48,6 @@
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/utilities/env_registry.h"
-#include "rocksdb/utilities/flashcache.h"
 #include "rocksdb/utilities/optimistic_transaction_db.h"
 #include "rocksdb/utilities/options_util.h"
 #include "rocksdb/utilities/sim_cache.h"
@@ -77,8 +75,6 @@ namespace {
 using GFLAGS::ParseCommandLineFlags;
 using GFLAGS::RegisterFlagValidator;
 using GFLAGS::SetUsageMessage;
-const int64_t zipf_sum_size = 100000;
-std::vector<double> sum_probs(100001);
 
 DEFINE_string(
     benchmarks,
@@ -107,7 +103,6 @@ DEFINE_string(
     "readrandomwriterandom,"
     "updaterandom,"
     "randomwithverify,"
-    "readwriteskewedworkload,"
     "fill100K,"
     "crc32c,"
     "xxhash,"
@@ -186,16 +181,10 @@ DEFINE_string(
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
-DEFINE_int64(prob, 5000, " the threshold for the prob variable");
-
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
              "read/write on fewer keys so that gets are more likely to find the"
              " key and puts are more likely to update the same key");
-
-DEFINE_int64(datasize, 1000,
-             "Number of distinct keys to use. Used in ReadWriteSkewedWorkload to "
-             "indicate database size");
 
 DEFINE_int64(merge_keys, -1,
              "Number of distinct keys to use for MergeRandom and "
@@ -476,8 +465,6 @@ DEFINE_bool(disable_data_sync, false, "If true, do not wait until data is"
 
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
-DEFINE_bool(zipfian, false, "Have a zipfian distribution or not");
-
 DEFINE_bool(disable_wal, false, "If true, do not write WAL for write.");
 
 DEFINE_string(wal_dir, "", "If not empty, use the given dir for WAL");
@@ -494,8 +481,8 @@ DEFINE_uint64(max_bytes_for_level_base,  10 * 1048576, "Max bytes for level-1");
 DEFINE_bool(level_compaction_dynamic_level_bytes, false,
             "Whether level size base is dynamic");
 
-DEFINE_double(max_bytes_for_level_multiplier, 10,
-              "A multiplier to compute max bytes for level-N (N >= 2)");
+DEFINE_int32(max_bytes_for_level_multiplier, 10,
+             "A multiplier to compute max bytes for level-N (N >= 2)");
 
 static std::vector<int> FLAGS_max_bytes_for_level_multiplier_additional_v;
 DEFINE_string(max_bytes_for_level_multiplier_additional, "",
@@ -585,8 +572,6 @@ DEFINE_string(
     "\t--row_cache_size\n"
     "\t--row_cache_numshardbits\n"
     "\t--enable_io_prio\n"
-    "\t--disable_flashcache_for_background_threads\n"
-    "\t--flashcache_dev\n"
     "\t--dump_malloc_stats\n"
     "\t--num_multi_db\n");
 #endif  // ROCKSDB_LITE
@@ -773,9 +758,6 @@ DEFINE_bool(mmap_read, rocksdb::EnvOptions().use_mmap_reads,
 DEFINE_bool(mmap_write, rocksdb::EnvOptions().use_mmap_writes,
             "Allow writes to occur via mmap-ing files");
 
-DEFINE_bool(use_direct_reads, rocksdb::EnvOptions().use_direct_reads,
-            "Use O_DIRECT for reading data");
-
 DEFINE_bool(advise_random_on_open, rocksdb::Options().advise_random_on_open,
             "Advise random access on table file open");
 
@@ -783,11 +765,6 @@ DEFINE_string(compaction_fadvice, "NORMAL",
               "Access pattern advice when a file is compacted");
 static auto FLAGS_compaction_fadvice_e =
   rocksdb::Options().access_hint_on_compaction_start;
-
-DEFINE_bool(disable_flashcache_for_background_threads, false,
-            "Disable flashcache for background threads");
-
-DEFINE_string(flashcache_dev, "", "Path to flashcache device");
 
 DEFINE_bool(use_tailing_iterator, false,
             "Use tailing iterator to access a series of keys instead of get");
@@ -924,8 +901,8 @@ static const bool FLAGS_readwritepercent_dummy __attribute__((unused)) =
 DEFINE_int32(disable_seek_compaction, false,
              "Not used, left here for backwards compatibility");
 
-//static const bool FLAGS_deletepercent_dummy __attribute__((unused)) =
-//    RegisterFlagValidator(&FLAGS_deletepercent, &ValidateInt32Percent);
+static const bool FLAGS_deletepercent_dummy __attribute__((unused)) =
+    RegisterFlagValidator(&FLAGS_deletepercent, &ValidateInt32Percent);
 static const bool FLAGS_table_cache_numshardbits_dummy __attribute__((unused)) =
     RegisterFlagValidator(&FLAGS_table_cache_numshardbits,
                           &ValidateTableCacheNumshardbits);
@@ -1746,7 +1723,6 @@ class Benchmark {
   int64_t keys_per_prefix_;
   int64_t entries_per_batch_;
   WriteOptions write_options_;
-  ColumnFamilyOptions col_fam_options_;
   Options open_options_;  // keep options around to properly destroy db later
   int64_t reads_;
   int64_t deletes_;
@@ -1755,7 +1731,6 @@ class Benchmark {
   int64_t readwrites_;
   int64_t merge_keys_;
   bool report_file_operations_;
-  int cachedev_fd_;
 
   bool SanityCheck() {
     if (FLAGS_compression_ratio > 1) {
@@ -2011,8 +1986,7 @@ class Benchmark {
                 ? FLAGS_num
                 : ((FLAGS_writes > FLAGS_reads) ? FLAGS_writes : FLAGS_reads)),
         merge_keys_(FLAGS_merge_keys < 0 ? FLAGS_num : FLAGS_merge_keys),
-        report_file_operations_(FLAGS_report_file_operations),
-        cachedev_fd_(-1) {
+        report_file_operations_(FLAGS_report_file_operations) {
     // use simcache instead of cache
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -2071,11 +2045,6 @@ class Benchmark {
       // this will leak, but we're shutting down so nobody cares
       cache_->DisownData();
     }
-    if (FLAGS_disable_flashcache_for_background_threads && cachedev_fd_ != -1) {
-      // Dtor for thiis env should run before cachedev_fd_ is closed
-      flashcache_aware_env_ = nullptr;
-      close(cachedev_fd_);
-    }
   }
 
   Slice AllocateKey(std::unique_ptr<const char[]>* key_guard) {
@@ -2098,8 +2067,8 @@ class Benchmark {
   //   |        key 00000         |
   //   ----------------------------
   void GenerateKeyFromInt(uint64_t v, int64_t num_keys, Slice* key) {
-    uint64_t* start = (uint64_t*)(key->data());
-    uint64_t* pos = start;
+    char* start = const_cast<char*>(key->data());
+    char* pos = start;
     if (keys_per_prefix_ > 0) {
       int64_t num_prefix = num_keys / keys_per_prefix_;
       int64_t prefix = v % num_prefix;
@@ -2119,37 +2088,17 @@ class Benchmark {
     }
 
     int bytes_to_fill = std::min(key_size_ - static_cast<int>(pos - start), 8);
-    
     if (port::kLittleEndian) {
-
       for (int i = 0; i < bytes_to_fill; ++i) {
-
-        pos[bytes_to_fill - i -1] = 0x00000000;
-        uint64_t x = (v >> (8*i)) & 0x000000ff;
-        pos[bytes_to_fill - i -1] = (x & 0x000000ff); 
+        pos[i] = (v >> ((bytes_to_fill - i - 1) << 3)) & 0xFF;
       }
-
     } else {
       memcpy(pos, static_cast<void*>(&v), bytes_to_fill);
     }
-
     pos += bytes_to_fill;
     if (key_size_ > pos - start) {
       memset(pos, '0', key_size_ - (pos - start));
     }
-
-  }
-
-  uint64_t IntKeyFromSlice(Slice* key){
-    uint64_t* data = (uint64_t*)key->data();
-    uint64_t key_integer = 0;
-    uint64_t radix = 1;
-    for (int i = key_size_ - 1 ; i >= 0; --i) {   
-        key_integer += radix * uint64_t(data[i]);
-        radix *= 256;
-    }
-    //printf("\n Integer conversion  ::::%lu:::: \n", key_integer);
-    return key_integer;
   }
 
   std::string GetPathForMultiple(std::string base_name, size_t id) {
@@ -2171,7 +2120,6 @@ class Benchmark {
     if (!SanityCheck()) {
       exit(1);
     }
-    std::cout << "Run!!\n";
     Open(&open_options_);
     PrintHeader();
     std::stringstream benchmark_stream(FLAGS_benchmarks);
@@ -2187,10 +2135,6 @@ class Benchmark {
       key_size_ = FLAGS_key_size;
       entries_per_batch_ = FLAGS_batch_size;
       write_options_ = WriteOptions();
-
-      col_fam_options_ = ColumnFamilyOptions();
-      col_fam_options_.inplace_update_support = true;
-
       read_random_exp_range_ = FLAGS_read_random_exp_range;
       if (FLAGS_sync) {
         write_options_.sync = true;
@@ -2354,8 +2298,6 @@ class Benchmark {
         method = &Benchmark::MergeRandom;
       } else if (name == "randomwithverify") {
         method = &Benchmark::RandomWithVerify;
-      } else if (name == "readwriteskewedworkload") {
-        method = &Benchmark::ReadWriteSkewedWorkload;
       } else if (name == "fillseekseq") {
         method = &Benchmark::WriteSeqSeekSeq;
       } else if (name == "compact") {
@@ -2458,7 +2400,6 @@ class Benchmark {
   }
 
  private:
-  std::unique_ptr<Env> flashcache_aware_env_;
   std::shared_ptr<TimestampEmulator> timestamp_emulator_;
 
   struct ThreadArg {
@@ -2765,9 +2706,6 @@ class Benchmark {
     options.max_background_flushes = FLAGS_max_background_flushes;
     options.compaction_style = FLAGS_compaction_style_e;
     options.compaction_pri = FLAGS_compaction_pri_e;
-    options.allow_mmap_reads = FLAGS_mmap_read;
-    options.allow_mmap_writes = FLAGS_mmap_write;
-    options.use_direct_reads = FLAGS_use_direct_reads;
     if (FLAGS_prefix_size != 0) {
       options.prefix_extractor.reset(
           NewFixedPrefixTransform(FLAGS_prefix_size));
@@ -3027,7 +2965,6 @@ class Benchmark {
     options.statistics = dbstats;
     options.wal_dir = FLAGS_wal_dir;
     options.create_if_missing = !FLAGS_use_existing_db;
-    options.dump_malloc_stats = FLAGS_dump_malloc_stats;
 
     if (FLAGS_row_cache_size) {
       if (FLAGS_cache_numshardbits >= 1) {
@@ -3041,23 +2978,7 @@ class Benchmark {
       FLAGS_env->LowerThreadPoolIOPriority(Env::LOW);
       FLAGS_env->LowerThreadPoolIOPriority(Env::HIGH);
     }
-    if (FLAGS_disable_flashcache_for_background_threads && cachedev_fd_ == -1) {
-      // Avoid creating the env twice when an use_existing_db is true
-      cachedev_fd_ = open(FLAGS_flashcache_dev.c_str(), O_RDONLY);
-      if (cachedev_fd_ < 0) {
-        fprintf(stderr, "Open flash device failed\n");
-        exit(1);
-      }
-      flashcache_aware_env_ = NewFlashcacheAwareEnv(FLAGS_env, cachedev_fd_);
-      if (flashcache_aware_env_.get() == nullptr) {
-        fprintf(stderr, "Failed to open flashcache device at %s\n",
-                FLAGS_flashcache_dev.c_str());
-        std::abort();
-      }
-      options.env = flashcache_aware_env_.get();
-    } else {
-      options.env = FLAGS_env;
-    }
+    options.env = FLAGS_env;
 
     if (FLAGS_num_multi_db <= 1) {
       OpenDb(options, FLAGS_db, &db_);
@@ -3073,6 +2994,7 @@ class Benchmark {
       }
       options.wal_dir = wal_dir;
     }
+    options.dump_malloc_stats = FLAGS_dump_malloc_stats;
   }
 
   void Open(Options* opts) {
@@ -4097,9 +4019,6 @@ class Benchmark {
     return s;
   }
 
-
-
-
   // Differs from readrandomwriterandom in the following ways:
   // (a) Uses GetMany/PutMany to read/write key values. Refer to those funcs.
   // (b) Does deletes as well (per FLAGS_deletepercent)
@@ -4176,303 +4095,63 @@ class Benchmark {
     thread->stats.AddMessage(msg);
   }
 
-  void ReadWriteSkewedWorkload(ThreadState* thread) {
-    // col_fam_options_ = ColumnFamilyOptions();
-    // col_fam_options_.inplace_update_support = true;
+  // This is different from ReadWhileWriting because it does not use
+  // an extra thread.
+  void ReadRandomWriteRandom(ThreadState* thread) {
     ReadOptions options(FLAGS_verify_checksum, true);
     RandomGenerator gen;
-    
     std::string value;
     int64_t found = 0;
     int get_weight = 0;
     int put_weight = 0;
-    //int delete_weight = 0;
-    int64_t gets_done = 0;
-    int64_t puts_done = 0;
-    //int64_t deletes_done = 0;
+    int64_t reads_done = 0;
+    int64_t writes_done = 0;
+    Duration duration(FLAGS_duration, readwrites_);
 
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
 
     // the number of iterations is the larger of read_ or write_
-    printf("Op count: %lu\n", readwrites_);
-    for (int64_t i = 0; i < readwrites_; i++) {
-
+    while (!duration.Done(1)) {
       DB* db = SelectDB(thread);
-      //if (get_weight == 0 && put_weight == 0 && delete_weight == 0) 
-      if (get_weight == 0 && put_weight == 0 ) {
+      GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
+      if (get_weight == 0 && put_weight == 0) {
         // one batch completed, reinitialize for next batch
         get_weight = FLAGS_readwritepercent;
-        //delete_weight = FLAGS_deletepercent;
-        //put_weight = 100 - get_weight - delete_weight;
         put_weight = 100 - get_weight;
       }
-
-      // probability for skew; fix at 90%
-      uint32_t prob = thread->rand.Next() % 10000;
-      uint32_t rand_key = thread->rand.Next();
-
-
-      std::string a;
-
-      if (prob <= FLAGS_prob){
-        rand_key = rand_key % FLAGS_numdistinct;
-        //GenerateKeyFromInt(rand_key, FLAGS_numdistinct, &key);
-      } else{
-        rand_key = FLAGS_numdistinct + (rand_key % (FLAGS_datasize - FLAGS_numdistinct) );
-        //GenerateKeyFromInt(rand_key, FLAGS_datasize, &key);
-      }
-
-      a = std::to_string(rand_key);
-      a += '\0';
-      key = Slice(a.c_str()); 
-      //std::cout << "Test KEY: [Slice:"<< std::string(key.data()) << "];[String:" << a << "]\n";
-
-
       if (get_weight > 0) {
         // do all the gets first
         Status s = db->Get(options, key, &value);
-        if (!s.ok()) {
-          //fprintf(stderr, "get error: %s\n", s.ToString().c_str());
+        if (!s.ok() && !s.IsNotFound()) {
+          fprintf(stderr, "get error: %s\n", s.ToString().c_str());
           // we continue after error rather than exiting so that we can
           // find more errors if any
         } else if (!s.IsNotFound()) {
           found++;
         }
         get_weight--;
-        gets_done++;
-        thread->stats.FinishedOps(&db_, db_.db, 1, kRead);
-      } else if (put_weight > 0) {
+        reads_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else  if (put_weight > 0) {
         // then do all the corresponding number of puts
         // for all the gets we have done earlier
-        
         Status s = db->Put(write_options_, key, gen.Generate(value_size_));
         if (!s.ok()) {
           fprintf(stderr, "put error: %s\n", s.ToString().c_str());
           exit(1);
         }
         put_weight--;
-        puts_done++;
-        thread->stats.FinishedOps(&db_, db_.db, 1, kWrite);
-    }
-      //  else if (delete_weight > 0) {
-      //   Status s = db->Delete(write_options_, key);
-      //   if (!s.ok()) {
-      //     fprintf(stderr, "delete error: %s\n", s.ToString().c_str());
-      //     exit(1);
-      //   }
-      //   delete_weight--;
-      //   deletes_done++;
-      //   thread->stats.FinishedOps(&db_, db_.db, 1, kDelete);
-      // }
+        writes_done++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
     }
     char msg[100];
-    // snprintf(msg, sizeof(msg),
-    //          "( get:%" PRIu64 " put:%" PRIu64 " del:%" PRIu64 " total:%" 
-    //          PRIu64 " found:%" PRIu64 ")",
-    //          gets_done, puts_done, deletes_done, readwrites_, found);
-
-    snprintf(msg, sizeof(msg),
-             "( get:%" PRIu64 " put:%" PRIu64 " total:%" \
-             PRIu64 " found:%" PRIu64 ")",
-             gets_done, puts_done, readwrites_, found);
+    snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
+             " total:%" PRIu64 " found:%" PRIu64 ")",
+             reads_done, writes_done, readwrites_, found);
     thread->stats.AddMessage(msg);
   }
-
-
-// Zipfian distribution is generated based on a pre-calculated array.
-// It should be used before start the stress test.
-// First, the probability distribution function (PDF) of this Zipfian follows
-// power low. P(x) = 1/(x^alpha).
-// So we calculate the PDF when x is from 0 to zipf_sum_size in first for loop
-// and add the PDF value togetger as c. So we get the total probability in c.
-// Next, we calculate inverse CDF of Zipfian and store the value of each in
-// an array (sum_probs). The rank is from 0 to zipf_sum_size. For example, for
-// integer k, its Zipfian CDF value is sum_probs[k].
-// Third, when we need to get an integer whose probability follows Zipfian
-// distribution, we use a rand_seed [0,1] which follows uniform distribution
-// as a seed and search it in the sum_probs via binary search. When we find
-// the closest sum_probs[i] of rand_seed, i is the integer that in
-// [0, zipf_sum_size] following Zipfian distribution with parameter alpha.
-// Finally, we can scale i to [0, max_key] scale.
-// In order to avoid that hot keys are close to each other and skew towards 0,
-// we use Rando64 to shuffle it.
-        void InitializeHotKeyGenerator(double alpha) {
-            double c = 0;
-            for (int64_t i = 1; i <= zipf_sum_size; i++) {
-                c = c + (1.0 / std::pow(static_cast<double>(i), alpha));
-            }
-            c = 1.0 / c;
-
-            sum_probs[0] = 0;
-            for (int64_t i = 1; i <= zipf_sum_size; i++) {
-                sum_probs[i] =
-                        sum_probs[i - 1] + c / std::pow(static_cast<double>(i), alpha);
-            }
-        }
-
-// Generate one key that follows the Zipfian distribution. The skewness
-// is decided by the parameter alpha. Input is the rand_seed [0,1] and
-// the max of the key to be generated. If we directly return tmp_zipf_seed,
-// the closer to 0, the higher probability will be. To randomly distribute
-// the hot keys in [0, max_key], we use Random64 to shuffle it.
-        int64_t GetOneHotKeyID(double rand_seed, int64_t max_key) {
-            int64_t low = 1, mid, high = zipf_sum_size, zipf = 0;
-            while (low <= high) {
-                mid = (low + high) / 2;
-                if (sum_probs[mid] >= rand_seed && sum_probs[mid - 1] < rand_seed) {
-                    zipf = mid;
-                    break;
-                } else if (sum_probs[mid] >= rand_seed) {
-                    high = mid - 1;
-                } else {
-                    low = mid + 1;
-                }
-            }
-            int64_t tmp_zipf_seed = zipf * max_key / zipf_sum_size;
-            Random64 rand_local(tmp_zipf_seed);
-            return rand_local.Next() % max_key;
-        }
-
-        // This is different from ReadWhileWriting because it does not use
-        // an extra thread.
-        void ReadRandomWriteRandom(ThreadState* thread) {
-            ReadOptions options(FLAGS_verify_checksum, true);
-            RandomGenerator gen;
-            std::string value;
-            int64_t found = 0;
-            int get_weight = 0;
-            int put_weight = 0;
-            int64_t reads_done = 0;
-            int64_t writes_done = 0;
-            Duration duration(FLAGS_duration, readwrites_);
-            InitializeHotKeyGenerator(0.99);
-
-            std::unique_ptr<const char[]> key_guard;
-            Slice key = AllocateKey(&key_guard);
-
-            std::unique_ptr<char[]> ts_guard;
-            if (user_timestamp_size_ > 0) {
-                ts_guard.reset(new char[user_timestamp_size_]);
-            }
-            FILE* f = fopen("analysis/keys.txt", "w");
-            // the number of iterations is the larger of read_ or write_
-            while (!duration.Done(1)) {
-                DB* db = SelectDB(thread);
-                int64_t keyValue;
-                double seed;
-                if (FLAGS_zipfian) {
-                    seed = static_cast<double>((thread->rand.Next() % FLAGS_num))/FLAGS_num;  // want a random seed between 0 and 1
-                    keyValue = GetOneHotKeyID(seed, FLAGS_num);
-                } else {
-                    keyValue = thread->rand.Next() % FLAGS_num;
-                }
-
-                fprintf(f, "%" PRIu64 "\n", keyValue);
-                GenerateKeyFromInt(keyValue, FLAGS_num, &key);
-                if (get_weight == 0 && put_weight == 0) {
-                    // one batch completed, reinitialize for next batch
-                    get_weight = FLAGS_readwritepercent;
-                    put_weight = 100 - get_weight;
-                }
-                if (get_weight > 0) {
-                    // do all the gets first
-                    Slice ts;
-                    if (user_timestamp_size_ > 0) {
-                        ts = mock_app_clock_->GetTimestampForRead(thread->rand,
-                                                                  ts_guard.get());
-                        options.timestamp = &ts;
-                    }
-                    Status s = db->Get(options, key, &value);
-                    if (!s.ok() && !s.IsNotFound()) {
-                        fprintf(stderr, "get error: %s\n", s.ToString().c_str());
-                        // we continue after error rather than exiting so that we can
-                        // find more errors if any
-                    } else if (!s.IsNotFound()) {
-                        get_weight--;
-                        reads_done++;
-                        thread->stats.FinishedOps(nullptr, db, 1, kRead);
-                    } else  if (put_weight > 0) {
-                        // then do all the corresponding number of puts
-                        // for all the gets we have done earlier
-                        Slice ts;
-                        if (user_timestamp_size_ > 0) {
-                            ts = mock_app_clock_->Allocate(ts_guard.get());
-                            write_options_.timestamp = &ts;
-                        }
-                        Status s = db->Put(write_options_, key, gen.Generate());
-                        if (!s.ok()) {
-                            fprintf(stderr, "put error: %s\n", s.ToString().c_str());
-                            ErrorExit();
-                        }
-                        put_weight--;
-                        writes_done++;
-                        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
-                    }
-                }
-                fclose(f);
-                char msg[100];
-                snprintf(msg, sizeof(msg), "( reads:%" PRIu64 " writes:%" PRIu64 \
-             " total:%" PRIu64 " found:%" PRIu64 ")",
-                         reads_done, writes_done, readwrites_, found);
-                thread->stats.AddMessage(msg);
-            }
-            int64_t found = 0;
-            int64_t bytes = 0;
-            Duration duration(FLAGS_duration, readwrites_);
-
-            std::unique_ptr<const char[]> key_guard;
-            Slice key = AllocateKey(&key_guard);
-            std::unique_ptr<char[]> ts_guard;
-            if (user_timestamp_size_ > 0) {
-                ts_guard.reset(new char[user_timestamp_size_]);
-            }
-            // the number of iterations is the larger of read_ or write_
-            while (!duration.Done(1)) {
-                DB* db = SelectDB(thread);
-                GenerateKeyFromInt(thread->rand.Next() % FLAGS_num, FLAGS_num, &key);
-                Slice ts;
-                if (user_timestamp_size_ > 0) {
-                    // Read with newest timestamp because we are doing rmw.
-                    ts = mock_app_clock_->Allocate(ts_guard.get());
-                    options.timestamp = &ts;
-                }
-
-                auto status = db->Get(options, key, &value);
-                if (status.ok()) {
-                    ++found;
-                    bytes += key.size() + value.size() + user_timestamp_size_;
-                } else if (!status.IsNotFound()) {
-                    fprintf(stderr, "Get returned an error: %s\n",
-                            status.ToString().c_str());
-                    abort();
-                }
-
-                if (thread->shared->write_rate_limiter) {
-                    thread->shared->write_rate_limiter->Request(
-                            key.size() + value.size(), Env::IO_HIGH, nullptr /*stats*/,
-                            RateLimiter::OpType::kWrite);
-                }
-
-                Slice val = gen.Generate();
-                if (user_timestamp_size_ > 0) {
-                    ts = mock_app_clock_->Allocate(ts_guard.get());
-                    write_options_.timestamp = &ts;
-                }
-                Status s = db->Put(write_options_, key, val);
-                if (!s.ok()) {
-                    fprintf(stderr, "put error: %s\n", s.ToString().c_str());
-                    exit(1);
-                }
-                bytes += key.size() + val.size() + user_timestamp_size_;
-                thread->stats.FinishedOps(nullptr, db, 1, kUpdate);
-            }
-            char msg[100];
-            snprintf(msg, sizeof(msg),
-                     "( updates:%" PRIu64 " found:%" PRIu64 ")", readwrites_, found);
-            thread->stats.AddBytes(bytes);
-            thread->stats.AddMessage(msg);
-        }
 
   //
   // Read-modify-write for random keys
@@ -5118,8 +4797,6 @@ int db_bench_tool(int argc, char** argv) {
     // at which the timer is checked for FLAGS_stats_interval_seconds
     FLAGS_stats_interval = 1000;
   }
-
-  printf("HOT COLD HLL\n");
 
   rocksdb::Benchmark benchmark;
   benchmark.Run();
