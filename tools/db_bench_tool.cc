@@ -188,6 +188,9 @@ DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
 DEFINE_int64(prob, 5000, " the threshold for the prob variable");
 
+DEFINE_int32(user_timestamp_size, 0,
+                 "number of bytes in a user-defined timestamp");
+
 DEFINE_int64(numdistinct, 1000,
              "Number of distinct keys to use. Used in RandomWithVerify to "
              "read/write on fewer keys so that gets are more likely to find the"
@@ -1658,6 +1661,25 @@ class TimestampEmulator {
   TimestampEmulator() : timestamp_(0) {}
   uint64_t Get() const { return timestamp_.load(); }
   void Inc() { timestamp_++; }
+    Slice Allocate(char* scratch) {
+        // TODO: support larger timestamp sizes
+        assert(FLAGS_user_timestamp_size == 8);
+        assert(scratch);
+        uint64_t ts = timestamp_.fetch_add(1);
+        EncodeFixed64(scratch, ts);
+        return Slice(scratch, FLAGS_user_timestamp_size);
+    }
+    Slice GetTimestampForRead(Random64& rand, char* scratch) {
+        assert(FLAGS_user_timestamp_size == 8);
+        assert(scratch);
+        if (FLAGS_read_with_latest_user_timestamp) {
+            return Allocate(scratch);
+        }
+        // Choose a random timestamp from the past.
+        uint64_t ts = rand.Next() % Get();
+        EncodeFixed64(scratch, ts);
+        return Slice(scratch, FLAGS_user_timestamp_size);
+    }
 };
 
 // State shared by all concurrent executions of the same benchmark.
@@ -1742,6 +1764,7 @@ class Benchmark {
   int64_t num_;
   int value_size_;
   int key_size_;
+  int user_timestamp_size_;
   int prefix_size_;
   int64_t keys_per_prefix_;
   int64_t entries_per_batch_;
@@ -2000,6 +2023,7 @@ class Benchmark {
         num_(FLAGS_num),
         value_size_(FLAGS_value_size),
         key_size_(FLAGS_key_size),
+        user_timestamp_size_(FLAGS_user_timestamp_size),
         prefix_size_(FLAGS_prefix_size),
         keys_per_prefix_(FLAGS_keys_per_prefix),
         entries_per_batch_(1),
