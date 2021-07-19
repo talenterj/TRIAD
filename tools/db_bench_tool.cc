@@ -4429,7 +4429,7 @@ class Benchmark {
                         Status s = db->Put(write_options_, key, gen.Generate());
                         if (!s.ok()) {
                             fprintf(stderr, "put error: %s\n", s.ToString().c_str());
-                            ErrorExit();
+                            //ErrorExit();
                         }
                         put_weight--;
                         writes_done++;
