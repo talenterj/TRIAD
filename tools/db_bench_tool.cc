@@ -1780,6 +1780,8 @@ class Benchmark {
   bool report_file_operations_;
   int cachedev_fd_;
 
+  std::unique_ptr<TimestampEmulator> mock_app_clock_;
+
   bool SanityCheck() {
     if (FLAGS_compression_ratio > 1) {
       fprintf(stderr, "compression_ratio should be between 0 and 1\n");

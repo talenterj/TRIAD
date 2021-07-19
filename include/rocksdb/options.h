@@ -1517,6 +1517,17 @@ struct ReadOptions {
   // Default: 0
   size_t readahead_size;
 
+    // Timestamp of write operation, e.g. Put. All timestamps of the same
+    // database must share the same length and format. The user is also
+    // responsible for providing a customized compare function via Comparator to
+    // order <key, timestamp> tuples. If the user wants to enable timestamp, then
+    // all write operations must be associated with timestamp because RocksDB, as
+    // a single-node storage engine currently has no knowledge of global time,
+    // thus has to rely on the application.
+    // The user-specified timestamp feature is still under active development,
+    // and the API is subject to change.
+    const Slice* timestamp;
+
   ReadOptions();
   ReadOptions(bool cksum, bool cache);
 };
@@ -1554,11 +1565,23 @@ struct WriteOptions {
   // Default: false
   bool ignore_missing_column_families;
 
+    // Timestamp of write operation, e.g. Put. All timestamps of the same
+    // database must share the same length and format. The user is also
+    // responsible for providing a customized compare function via Comparator to
+    // order <key, timestamp> tuples. If the user wants to enable timestamp, then
+    // all write operations must be associated with timestamp because RocksDB, as
+    // a single-node storage engine currently has no knowledge of global time,
+    // thus has to rely on the application.
+    // The user-specified timestamp feature is still under active development,
+    // and the API is subject to change.
+    const Slice* timestamp;
+
   WriteOptions()
       : sync(false),
         disableWAL(false),
         timeout_hint_us(0),
-        ignore_missing_column_families(false) {}
+        ignore_missing_column_families(false)
+        timestamp(nullptr) {}
 };
 
 // Options that control flush operations
