@@ -8,7 +8,8 @@
 
 CLEAN_FILES = # deliberately empty, so we can append below.
 CFLAGS += ${EXTRA_CFLAGS}
-CXXFLAGS += ${EXTRA_CXXFLAGS}
+# CXXFLAGS += ${EXTRA_CXXFLAGS}
+CXXFLAGS += -std=gnu++11
 LDFLAGS += $(EXTRA_LDFLAGS)
 MACHINE ?= $(shell uname -m)
 ARFLAGS = rs
