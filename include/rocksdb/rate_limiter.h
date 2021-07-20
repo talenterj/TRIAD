@@ -75,7 +75,7 @@ namespace ROCKSDB_NAMESPACE {
         // direct I/O) to allocate an appropriate number of bytes, which may be less
         // than the number of bytes requested.
         virtual size_t RequestToken(size_t bytes, size_t alignment,
-                                    Env::IOPriority io_priority, rocksdb::Statistics* stats,
+                                    rocksdb::Env::IOPriority io_priority, rocksdb::Statistics* stats,
                                     RateLimiter::OpType op_type);
 
         // Max bytes can be granted in a single burst
