@@ -32,6 +32,7 @@
 #include <thread>
 #include <unordered_map>
 #include <bitset>
+#include <functional>
 
 #include "db/db_impl.h"
 #include "db/version_set.h"
