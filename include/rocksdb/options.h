@@ -1580,7 +1580,7 @@ struct WriteOptions {
       : sync(false),
         disableWAL(false),
         timeout_hint_us(0),
-        ignore_missing_column_families(false)
+        ignore_missing_column_families(false),
         timestamp(nullptr) {}
 };
 
