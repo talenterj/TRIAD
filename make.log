@@ -1,3 +1,1 @@
   GEN      util/build_version.cc
-  GEN      util/build_version.cc
-  CC       tools/db_bench.o
